@@ -1,0 +1,54 @@
+# Scale-out example: several API replicas behind nginx, sharing rate limits through Redis. Use it on top of the base file:
+#   docker compose -f docker-compose.yml -f docker-compose.scale.yml up -d --scale api=3
+# Every replica runs the same image against the same PostgreSQL. What is shared and how:
+#   jobs, claims, quotas, audit    PostgreSQL (row locks and advisory locks; nothing relies on which replica handled a request)
+#   live updates                   PostgreSQL LISTEN/NOTIFY, one listener connection per replica
+#   rate limits                    Redis; without it each replica counts separately, so the real limit is N times the configured one
+#   background work                the outbox, retention, anchoring and purge workers run on every replica and coordinate in PostgreSQL
+# Redis here holds counters only and keeps nothing on disk: losing it resets rate-limit windows, nothing else. The API keeps working
+# on per-replica counters while Redis is unreachable and picks the shared ones up again when it returns.
+# Size DB_POOL_SIZE so that replicas x (DB_POOL_SIZE + 1) stays below PostgreSQL's max_connections (100 by default) with headroom.
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "volatile-ttl"]
+    user: "999:1000" # the image's redis user: started as root the entrypoint would have to drop privileges, which cap_drop forbids
+    read_only: true
+    tmpfs: ["/data:uid=999,gid=1000"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [db]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    deploy: { resources: { limits: { cpus: "0.5", memory: 192M } } }
+    restart: unless-stopped
+
+  api:
+    environment:
+      REDIS_URL: redis://redis:6379
+      TRUST_PROXY: "1" # nginx is the one hop in front: take the client address from its X-Forwarded-For
+    depends_on:
+      redis: { condition: service_healthy }
+    ports: !reset []
+    deploy:
+      replicas: ${API_REPLICAS:-3}
+      resources: { limits: { cpus: "1.0", memory: 512M } }
+
+  lb:
+    image: nginx:alpine
+    volumes:
+      - ./deploy/nginx.scale.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "127.0.0.1:${LB_PORT:-8080}:8080"
+    networks: [default] # reaches the replicas through their default-network address; it has no route to PostgreSQL or Redis
+    depends_on: [api]
+    read_only: true
+    tmpfs: [/tmp, /var/cache/nginx, /var/run]
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETGID, SETUID]
+    security_opt: ["no-new-privileges:true"]
+    deploy: { resources: { limits: { cpus: "1.0", memory: 128M } } }
+    restart: unless-stopped

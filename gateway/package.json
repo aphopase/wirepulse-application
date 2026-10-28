@@ -1,0 +1,13 @@
+{
+  "name": "@wirepulse/gateway",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "start": "node src/agent.mjs",
+    "test": "node --test --test-timeout=30000 test/*.test.mjs"
+  },
+  "optionalDependencies": {
+    "serialport": "^12.0.0"
+  }
+}

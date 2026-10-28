@@ -1,0 +1,112 @@
+# WirePulse control plane: PostgreSQL + a one-shot schema migration + the API.
+# Secrets are files (./scripts/init-secrets.sh creates them), never environment variables.
+# TLS is terminated by your reverse proxy / load balancer; the API only listens on 127.0.0.1.
+
+x-api: &api
+  build: ./api
+  image: wirepulse-api:local
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  secrets: [database_url]
+  networks: [db]
+  logging: { driver: json-file, options: { max-size: 10m, max-file: "5" } }
+
+# One configuration for the API and the migration job (the migration validates the same settings).
+x-env: &env
+  # Production by default: startup fails fast unless OIDC and https CORS origins are configured.
+  # For a local trial set NODE_ENV=development plus DEV_BEARER_TOKEN in .env.
+  NODE_ENV: ${NODE_ENV:-production}
+  PORT: "8080"
+  DATABASE_URL_FILE: /run/secrets/database_url
+  MIGRATE_ON_START: "false" # the migrate service owns the schema; replicas never race to migrate
+  CORS_ORIGINS: ${CORS_ORIGINS:-}
+  TRUST_PROXY: ${TRUST_PROXY:-}
+  OIDC_ISSUER: ${OIDC_ISSUER:-}
+  OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+  OIDC_JWKS_URI: ${OIDC_JWKS_URI:-}
+  DEV_BEARER_TOKEN: ${DEV_BEARER_TOKEN:-}
+  DEV_SUBJECT: ${DEV_SUBJECT:-}
+  DEV_EMAIL: ${DEV_EMAIL:-}
+  METRICS_TOKEN: ${METRICS_TOKEN:-}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-240}
+  RATE_LIMIT_IP_PER_MINUTE: ${RATE_LIMIT_IP_PER_MINUTE:-1200}
+  AUTH_FAILURE_LIMIT_PER_MINUTE: ${AUTH_FAILURE_LIMIT_PER_MINUTE:-30}
+  GATEWAY_RATE_LIMIT_PER_MINUTE: ${GATEWAY_RATE_LIMIT_PER_MINUTE:-600}
+  RETENTION_DAYS_JOBS: ${RETENTION_DAYS_JOBS:-0}
+  RETENTION_DAYS_REPORTS: ${RETENTION_DAYS_REPORTS:-0}
+  RETENTION_DAYS_AUDIT: ${RETENTION_DAYS_AUDIT:-0}
+  # Scale, SaaS and integrations. All optional (empty means off or the default); DEPLOYMENT.md explains each. SMTP_URL and
+  # WEBHOOK_SIGNING_KEY are credentials: like METRICS_TOKEN they come from the environment here; to keep them out of it, set the
+  # matching SMTP_URL_FILE / WEBHOOK_SIGNING_KEY_FILE to a mounted secret instead.
+  REDIS_URL: ${REDIS_URL:-}
+  DB_POOL_SIZE: ${DB_POOL_SIZE:-10}
+  DEFAULT_PLAN: ${DEFAULT_PLAN:-enterprise}
+  MAX_WORKSPACES_PER_USER: ${MAX_WORKSPACES_PER_USER:-0}
+  WORKSPACE_PURGE_GRACE_DAYS: ${WORKSPACE_PURGE_GRACE_DAYS:-30}
+  AUDIT_ANCHOR_INTERVAL_MINUTES: ${AUDIT_ANCHOR_INTERVAL_MINUTES:-0}
+  SMTP_URL: ${SMTP_URL:-}
+  SMTP_FROM: ${SMTP_FROM:-}
+  INVITE_BASE_URL: ${INVITE_BASE_URL:-}
+  WEBHOOK_SIGNING_KEY: ${WEBHOOK_SIGNING_KEY:-}
+  WEBHOOK_ALLOWED_CIDRS: ${WEBHOOK_ALLOWED_CIDRS:-}
+  OUTBOX_RETENTION_DAYS: ${OUTBOX_RETENTION_DAYS:-14}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wirepulse
+      POSTGRES_USER: wirepulse
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks: [db] # internal network: no route in or out, and no published port
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wirepulse -d wirepulse"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    security_opt: ["no-new-privileges:true"]
+    deploy: { resources: { limits: { cpus: "2.0", memory: 1G } } }
+    logging: { driver: json-file, options: { max-size: 10m, max-file: "5" } }
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  migrate:
+    <<: *api
+    command: ["node", "src/migrate-cli.mjs"]
+    environment: *env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    <<: *api
+    environment: *env
+    networks: [db, default] # default: published port and outbound access to the OIDC provider's JWKS
+    depends_on:
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    ports:
+      - "127.0.0.1:${API_PORT:-8080}:8080"
+    deploy: { resources: { limits: { cpus: "1.0", memory: 512M } } }
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+networks:
+  db:
+    internal: true
+
+secrets:
+  # Keep this directory on a local disk (e.g. /etc/wirepulse); a root-squashed network mount cannot be bind-mounted.
+  postgres_password:
+    file: ${WIREPULSE_SECRETS_DIR:-./secrets}/postgres_password
+  database_url:
+    file: ${WIREPULSE_SECRETS_DIR:-./secrets}/database_url
+
+volumes:
+  postgres-data:
